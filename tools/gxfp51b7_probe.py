@@ -64,6 +64,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dev", default="/dev/gxfp")
     ap.add_argument("--timeout", type=float, default=2.0)
+    ap.add_argument("--cmd", type=lambda s: int(s, 16),
+                    help="send one raw command instead of the default probe (hex)")
+    ap.add_argument("--payload", default="", help="payload for --cmd, hex")
     a = ap.parse_args()
 
     fd = os.open(a.dev, os.O_RDWR)
@@ -71,8 +74,11 @@ def main():
     rec_size = REC_HDR.size + rx_max
     print(f"variant={variant} tx_max={tx_max:#x} rx_max={rx_max:#x}")
 
-    request(fd, rec_size, 0xA8, b"\x00\x00", a.timeout)               # firmware version
-    request(fd, rec_size, 0x82, b"\x00\x00\x00\x04\x00", a.timeout)   # reg 0, 4 bytes: chip id
+    if a.cmd is not None:
+        request(fd, rec_size, a.cmd, bytes.fromhex(a.payload), a.timeout)
+    else:
+        request(fd, rec_size, 0xA8, b"\x00\x00", a.timeout)               # firmware version
+        request(fd, rec_size, 0x82, b"\x00\x00\x00\x04\x00", a.timeout)   # reg 0, 4 bytes: chip id
     os.close(fd)
 
 
