@@ -11,7 +11,7 @@ work="${GXFP_WORK:-$HOME/.cache/gxfp-build}"
 
 # Build dependencies; idempotent.
 sudo -n apt-get install -y --no-install-recommends \
-  build-essential cmake git python3-jsonschema python3-jinja2 \
+  build-essential cmake git python3-jsonschema python3-jinja2 python3-cryptography \
   "linux-headers-$(uname -r)" >/dev/null
 
 # mbedtls 3.6 LTS (the distro ships 2.28, whose API differs).
