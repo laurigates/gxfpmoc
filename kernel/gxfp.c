@@ -46,15 +46,70 @@
 #define GXFP_READ_DONE_HIGH_US	50
 #define GXFP_READ_DONE_POST_US	200
 
+/*
+ * GXFP51B7 (MateBook X Pro 2020). Layout and timings from the Windows
+ * driver gfspi.dll 1.1.151.18: PeripheralWriteWrapper, MilanEvtInterruptIsr.
+ */
+#define GXFP51B7_WINDOW_SIZE	0x8000u
+#define GXFP51B7_TX_MAX		0x1000u
+#define GXFP51B7_RX_HDR_OFFSET	0x1000u
+#define GXFP51B7_RX_HDR_LEN	4u
+#define GXFP51B7_RX_MAX		(GXFP51B7_WINDOW_SIZE - GXFP51B7_RX_HDR_OFFSET)
+#define GXFP51B7_RX_FIFO_SIZE	SZ_1M
+#define GXFP51B7_ACK_LOW_US	5000
+#define GXFP51B7_DSM_REV	0
+#define GXFP51B7_DSM_DOORBELL	2
+
+static const guid_t gxfp51b7_dsm_guid =
+	GUID_INIT(0xcc58b68a, 0x4479, 0x4893,
+		  0xa8, 0xbb, 0x96, 0x12, 0x09, 0xdb, 0x59, 0xe5);
+
+struct gxfp_variant {
+	u32 id;			/* GXFP_VARIANT_* */
+	u32 window_size;
+	u32 tx_max;
+	u32 rx_max;		/* record payload bytes */
+	u32 fifo_size;
+};
+
+static const struct gxfp_variant gxfp_variant_5130 = {
+	.id = GXFP_VARIANT_5130,
+	.window_size = GXFP_WINDOW_SIZE,
+	.tx_max = GXFP_TX_MAX,
+	.rx_max = GXFP_RX_MAX,
+	.fifo_size = GXFP_RX_FIFO_SIZE,
+};
+
+static const struct gxfp_variant gxfp_variant_51b7 = {
+	.id = GXFP_VARIANT_51B7,
+	.window_size = GXFP51B7_WINDOW_SIZE,
+	.tx_max = GXFP51B7_TX_MAX,
+	.rx_max = GXFP51B7_RX_MAX,
+	.fifo_size = GXFP51B7_RX_FIFO_SIZE,
+};
+
+static inline bool gxfp_is_51b7(const struct gxfp_variant *v)
+{
+	return v->id == GXFP_VARIANT_51B7;
+}
+
+static inline size_t gxfp_record_size(const struct gxfp_variant *v)
+{
+	return sizeof(struct gxfp_rx_record) + v->rx_max;
+}
+
 struct gxfp {
 	struct device *dev;
 	struct miscdevice misc;
+	const struct gxfp_variant *v;
 
 	void __iomem *window;
 
-	struct gpio_desc *gpio_write_done;
-	struct gpio_desc *gpio_read_done;
+	struct gpio_desc *gpio_write_done;	/* 5130 only */
+	struct gpio_desc *gpio_read_done;	/* 5130 only */
+	struct gpio_desc *gpio_ack;		/* 51B7 only: RX ack, idles high */
 	struct gpio_desc *gpio_irq;
+	u32 rx_bad_headers;
 	int irq;
 	unsigned int irq_flags;
 
@@ -151,6 +206,54 @@ static unsigned int gxfp_acpi_irq_type(u8 triggering, u8 polarity)
 	return IRQ_TYPE_NONE;
 }
 
+static const struct gxfp_variant *g_variant_of(struct platform_device *pdev)
+{
+	const struct gxfp_variant *v = device_get_match_data(&pdev->dev);
+
+	return v ?: &gxfp_variant_5130;
+}
+
+/*
+ * GXFP51B7 _CRS: one GpioInt (MCU -> host doorbell) and one output-only
+ * GpioIo (host -> MCU RX acknowledge, idles high, pulsed low).
+ */
+static int gxfp51b7_add_gpio_mapping(struct platform_device *pdev,
+				     const struct gxfp_crs *st,
+				     unsigned int *irq_flags)
+{
+	struct acpi_gpio_params *params;
+	struct acpi_gpio_mapping *map;
+
+	if (st->int_index < 0 || st->int_seen != 1 || st->io_seen != 1 ||
+	    st->io_index[0] < 0)
+		return -ENOENT;
+	if (st->int_polarity != ACPI_ACTIVE_HIGH &&
+	    st->int_polarity != ACPI_ACTIVE_LOW)
+		return -EINVAL;
+
+	if (irq_flags)
+		*irq_flags = gxfp_acpi_irq_type(st->int_triggering,
+						st->int_polarity);
+
+	params = devm_kcalloc(&pdev->dev, 2, sizeof(*params), GFP_KERNEL);
+	map = devm_kcalloc(&pdev->dev, 3, sizeof(*map), GFP_KERNEL);
+	if (!params || !map)
+		return -ENOMEM;
+
+	params[0].crs_entry_index = st->int_index;
+	map[0].name = "irq-gpios";
+	map[0].data = &params[0];
+	map[0].size = 1;
+
+	/* Drive raw levels: the GpioIo carries no polarity. */
+	params[1].crs_entry_index = st->io_index[0];
+	map[1].name = "ack-gpios";
+	map[1].data = &params[1];
+	map[1].size = 1;
+
+	return devm_acpi_dev_add_driver_gpios(&pdev->dev, map);
+}
+
 static int gxfp_add_gpio_mapping(struct platform_device *pdev,
 				 unsigned int *irq_flags)
 {
@@ -172,6 +275,9 @@ static int gxfp_add_gpio_mapping(struct platform_device *pdev,
 	acpi_dev_free_resource_list(&res_list);
 	if (ret < 0)
 		return ret;
+
+	if (gxfp_is_51b7(g_variant_of(pdev)))
+		return gxfp51b7_add_gpio_mapping(pdev, &st, irq_flags);
 
 	if (st.int_index < 0 || st.int_seen != 1 || st.io_seen != 2 ||
 	    st.io_index[0] < 0 || st.io_index[1] < 0)
@@ -227,12 +333,40 @@ static int gxfp_add_gpio_mapping(struct platform_device *pdev,
 	return devm_acpi_dev_add_driver_gpios(&pdev->dev, map);
 }
 
+static int gxfp51b7_init_gpios(struct platform_device *pdev, struct gxfp *g)
+{
+	struct gpio_desc *desc;
+	int ret;
+
+	ret = gxfp_add_gpio_mapping(pdev, &g->irq_flags);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to add ACPI GPIO mapping\n");
+
+	desc = devm_gpiod_get(&pdev->dev, "ack", GPIOD_OUT_HIGH);
+	if (IS_ERR(desc))
+		return dev_err_probe(&pdev->dev, PTR_ERR(desc),
+				     "failed to get ack GPIO\n");
+	g->gpio_ack = desc;
+
+	desc = devm_gpiod_get(&pdev->dev, "irq", GPIOD_IN);
+	if (IS_ERR(desc))
+		return dev_err_probe(&pdev->dev, PTR_ERR(desc),
+				     "failed to get irq GPIO\n");
+	g->gpio_irq = desc;
+
+	return 0;
+}
+
 static int gxfp_init_gpios(struct platform_device *pdev,
 			   struct gxfp *g)
 {
 	struct gpio_desc *desc;
 	bool mapped = false;
 	int ret;
+
+	if (gxfp_is_51b7(g->v))
+		return gxfp51b7_init_gpios(pdev, g);
 
 	desc = devm_gpiod_get(&pdev->dev, "write-done", GPIOD_OUT_LOW);
 	if (IS_ERR(desc) && PTR_ERR(desc) == -ENOENT) {
@@ -331,29 +465,61 @@ static void gxfp_pulse_read_done(struct gxfp *g)
  * Interrupt handling
  */
 
-static irqreturn_t gxfp_irq_thread(int irq, void *data)
+/*
+ * GXFP51B7 doorbell: the Windows driver evaluates _DSM function 2 after
+ * every TX copy; the method issues EC command 0xF0.
+ */
+static int gxfp51b7_doorbell(struct gxfp *g)
 {
-	struct gxfp *g = data;
+	acpi_handle handle = ACPI_HANDLE(g->dev);
+	union acpi_object *obj;
+
+	obj = acpi_evaluate_dsm(handle, &gxfp51b7_dsm_guid, GXFP51B7_DSM_REV,
+				GXFP51B7_DSM_DOORBELL, NULL);
+	if (!obj)
+		return -EIO;
+	ACPI_FREE(obj);
+	return 0;
+}
+
+/* RX acknowledge: drive low for at least 5 ms, then back to idle high. */
+static void gxfp51b7_ack(struct gxfp *g)
+{
+	gpiod_set_raw_value_cansleep(g->gpio_ack, 0);
+	fsleep(GXFP51B7_ACK_LOW_US);
+	gpiod_set_raw_value_cansleep(g->gpio_ack, 1);
+}
+
+/* Header: type << 4, length LE16, checksum = sum of the first three bytes. */
+static bool gxfp51b7_header_ok(const u8 *hdr, u16 *len)
+{
+	u16 l = get_unaligned_le16(hdr + 1);
+
+	if ((u8)(hdr[0] + hdr[1] + hdr[2]) != hdr[3])
+		return false;
+	if (hdr[0] & 0x0f)
+		return false;
+	if (l > GXFP51B7_RX_MAX - GXFP51B7_RX_HDR_LEN)
+		return false;
+	*len = l;
+	return true;
+}
+
+static void gxfp_queue_record(struct gxfp *g, u32 len)
+{
 	struct gxfp_rx_record header;
 	unsigned long flags;
 	bool dropped = false;
-	bool queue = !READ_ONCE(g->removed) && !READ_ONCE(g->suspended);
+	size_t rec = gxfp_record_size(g->v);
 
 	memset(&header, 0, sizeof(header));
-	header.len = GXFP_RX_MAX;
+	header.len = len;
 	header.timestamp_ns = ktime_get_ns();
 
-	gxfp_read_rx(g);
-	gxfp_pulse_read_done(g);
-
-	if (!queue)
-		return IRQ_HANDLED;
-
 	spin_lock_irqsave(&g->rx_lock, flags);
-	if (g->rx_fifo_ready &&
-	    kfifo_avail(&g->rx_fifo) >= GXFP_RX_RECORD_SIZE) {
+	if (g->rx_fifo_ready && kfifo_avail(&g->rx_fifo) >= rec) {
 		kfifo_in(&g->rx_fifo, &header, sizeof(header));
-		kfifo_in(&g->rx_fifo, g->rx_buf, GXFP_RX_MAX);
+		kfifo_in(&g->rx_fifo, g->rx_buf, g->v->rx_max);
 		atomic_inc(&g->queued_records);
 	} else {
 		g->rx_overflow = true;
@@ -366,9 +532,56 @@ static irqreturn_t gxfp_irq_thread(int irq, void *data)
 	if (dropped)
 		dev_warn_ratelimited(g->dev,
 				     "RX queue full; dropping %u-byte record\n",
-				     GXFP_RX_MAX);
+				     len);
 
 	wake_up_interruptible(&g->rx_wait);
+}
+
+static irqreturn_t gxfp51b7_irq_thread(struct gxfp *g)
+{
+	bool queue = !READ_ONCE(g->removed) && !READ_ONCE(g->suspended);
+	u8 *hdr = g->rx_buf;
+	u16 len;
+
+	memcpy_fromio(hdr, g->window + GXFP51B7_RX_HDR_OFFSET,
+		      GXFP51B7_RX_HDR_LEN);
+	if (!gxfp51b7_header_ok(hdr, &len)) {
+		g->rx_bad_headers++;
+		dev_warn_ratelimited(g->dev,
+				     "bad RX header %*ph (%u so far)\n",
+				     GXFP51B7_RX_HDR_LEN, hdr,
+				     g->rx_bad_headers);
+		gxfp51b7_ack(g);
+		return IRQ_HANDLED;
+	}
+
+	memset(g->rx_buf + GXFP51B7_RX_HDR_LEN, 0,
+	       g->v->rx_max - GXFP51B7_RX_HDR_LEN);
+	memcpy_fromio(g->rx_buf + GXFP51B7_RX_HDR_LEN,
+		      g->window + GXFP51B7_RX_HDR_OFFSET + GXFP51B7_RX_HDR_LEN,
+		      len);
+	/* Complete the snapshot before acknowledging it. */
+	rmb();
+	gxfp51b7_ack(g);
+
+	if (queue)
+		gxfp_queue_record(g, GXFP51B7_RX_HDR_LEN + len);
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t gxfp_irq_thread(int irq, void *data)
+{
+	struct gxfp *g = data;
+	bool queue = !READ_ONCE(g->removed) && !READ_ONCE(g->suspended);
+
+	if (gxfp_is_51b7(g->v))
+		return gxfp51b7_irq_thread(g);
+
+	gxfp_read_rx(g);
+	gxfp_pulse_read_done(g);
+
+	if (queue)
+		gxfp_queue_record(g, GXFP_RX_MAX);
 	return IRQ_HANDLED;
 }
 
@@ -451,7 +664,7 @@ static ssize_t gxfp_write(struct file *file, const char __user *buf,
 
 	if (!g)
 		return -ENODEV;
-	if (count == 0 || count > GXFP_TX_MAX)
+	if (count == 0 || count > g->v->tx_max)
 		return -EMSGSIZE;
 
 	guard(mutex)(&g->tx_lock);
@@ -461,9 +674,21 @@ static ssize_t gxfp_write(struct file *file, const char __user *buf,
 	if (READ_ONCE(g->suspended))
 		return -EHOSTDOWN;
 
-	memset(g->tx_buf, 0, GXFP_TX_MAX);
+	memset(g->tx_buf, 0, g->v->tx_max);
 	if (copy_from_user(g->tx_buf, buf, count))
 		return -EFAULT;
+
+	if (gxfp_is_51b7(g->v)) {
+		int ret;
+
+		/* Byte-exact copy, as gfspi does; no wrapper or padding. */
+		memcpy_toio(g->window, g->tx_buf, count);
+		wmb();
+		ret = gxfp51b7_doorbell(g);
+		if (ret)
+			return ret;
+		return count;
+	}
 
 	tx_len = ALIGN(count, sizeof(u64));
 	gxfp_write_tx(g, tx_len);
@@ -485,7 +710,7 @@ static ssize_t gxfp_read(struct file *file, char __user *buf,
 
 	if (!g)
 		return -ENODEV;
-	if (count < GXFP_RX_RECORD_SIZE)
+	if (count < gxfp_record_size(g->v))
 		return -EMSGSIZE;
 
 	ret = mutex_lock_interruptible(&g->rx_read_lock);
@@ -519,8 +744,8 @@ static ssize_t gxfp_read(struct file *file, char __user *buf,
 
 		if (atomic_read(&g->queued_records) > 0) {
 			if (kfifo_out(&g->rx_fifo, g->rx_read_buf,
-				      GXFP_RX_RECORD_SIZE) !=
-			    GXFP_RX_RECORD_SIZE) {
+				      gxfp_record_size(g->v)) !=
+			    gxfp_record_size(g->v)) {
 				kfifo_reset(&g->rx_fifo);
 				atomic_set(&g->queued_records, 0);
 				spin_unlock_irqrestore(&g->rx_lock, flags);
@@ -531,10 +756,10 @@ static ssize_t gxfp_read(struct file *file, char __user *buf,
 			spin_unlock_irqrestore(&g->rx_lock, flags);
 
 			if (copy_to_user(buf, g->rx_read_buf,
-					 GXFP_RX_RECORD_SIZE))
+					 gxfp_record_size(g->v)))
 				ret = -EFAULT;
 			else
-				ret = GXFP_RX_RECORD_SIZE;
+				ret = gxfp_record_size(g->v);
 			break;
 		}
 
@@ -591,12 +816,21 @@ static long gxfp_ioctl(struct file *file, unsigned int cmd,
 	struct gxfp *g = file->private_data;
 	unsigned long flags;
 
-	(void)arg;
-
 	if (!g)
 		return -ENODEV;
 
 	switch (cmd) {
+	case GXFP_IOCTL_GET_INFO: {
+		struct gxfp_info info = {
+			.variant = g->v->id,
+			.tx_max = g->v->tx_max,
+			.rx_max = g->v->rx_max,
+		};
+
+		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+			return -EFAULT;
+		return 0;
+	}
 	case GXFP_IOCTL_FLUSH_RX:
 		if (READ_ONCE(g->removed))
 			return -ENODEV;
@@ -642,6 +876,7 @@ static int gxfp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	g->dev = &pdev->dev;
+	g->v = g_variant_of(pdev);
 	mutex_init(&g->open_lock);
 	mutex_init(&g->tx_lock);
 	mutex_init(&g->rx_read_lock);
@@ -660,7 +895,7 @@ static int gxfp_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, -ENODEV,
 				     "missing mailbox MMIO resource\n");
 	}
-	if (resource_size(res) < GXFP_WINDOW_SIZE) {
+	if (resource_size(res) < g->v->window_size) {
 		return dev_err_probe(&pdev->dev, -ENODEV,
 				     "mailbox window too small: %pa\n",
 				     &res->start);
@@ -670,23 +905,23 @@ static int gxfp_probe(struct platform_device *pdev)
 	if (IS_ERR(g->window))
 		return PTR_ERR(g->window);
 
-	g->tx_buf = kzalloc(GXFP_TX_MAX, GFP_KERNEL);
+	g->tx_buf = kzalloc(g->v->tx_max, GFP_KERNEL);
 	if (!g->tx_buf)
 		return -ENOMEM;
 
-	g->rx_buf = kzalloc(GXFP_RX_MAX, GFP_KERNEL);
+	g->rx_buf = kzalloc(g->v->rx_max, GFP_KERNEL);
 	if (!g->rx_buf)
 		return -ENOMEM;
 
-	g->rx_read_buf = kzalloc(GXFP_RX_RECORD_SIZE, GFP_KERNEL);
+	g->rx_read_buf = kzalloc(gxfp_record_size(g->v), GFP_KERNEL);
 	if (!g->rx_read_buf)
 		return -ENOMEM;
 
-	g->rx_fifo_buf = kvmalloc(GXFP_RX_FIFO_SIZE, GFP_KERNEL);
+	g->rx_fifo_buf = kvmalloc(g->v->fifo_size, GFP_KERNEL);
 	if (!g->rx_fifo_buf)
 		return -ENOMEM;
 
-	ret = kfifo_init(&g->rx_fifo, g->rx_fifo_buf, GXFP_RX_FIFO_SIZE);
+	ret = kfifo_init(&g->rx_fifo, g->rx_fifo_buf, g->v->fifo_size);
 	if (ret)
 		return ret;
 	g->rx_fifo_ready = true;
@@ -825,7 +1060,8 @@ static DEFINE_SIMPLE_DEV_PM_OPS(gxfp_pm_ops, gxfp_suspend,
 				gxfp_resume);
 
 static const struct acpi_device_id gxfp_acpi_ids[] = {
-	{ "GXFP5130", 0 },
+	{ "GXFP5130", (kernel_ulong_t)&gxfp_variant_5130 },
+	{ "GXFP51B7", (kernel_ulong_t)&gxfp_variant_51b7 },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, gxfp_acpi_ids);
@@ -841,5 +1077,5 @@ static struct platform_driver gxfp_driver = {
 };
 module_platform_driver(gxfp_driver);
 
-MODULE_DESCRIPTION("Goodix GXFP5130 EC mailbox transport");
+MODULE_DESCRIPTION("Goodix GXFP5130/GXFP51B7 EC mailbox transport");
 MODULE_LICENSE("GPL");

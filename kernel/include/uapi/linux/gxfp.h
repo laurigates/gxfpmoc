@@ -46,4 +46,37 @@ struct gxfp_rx_record {
 /* Discard all queued RX records. */
 #define GXFP_IOCTL_FLUSH_RX	_IO(GXFP_IOCTL_MAGIC, 0x00)
 
+/*
+ * Transport variants.
+ *
+ * GXFP_VARIANT_5130: the layout described above. TX frames carry the
+ *   8-byte mailbox wrapper and RX records are fixed GXFP_RX_MAX chunks.
+ *
+ * GXFP_VARIANT_51B7: MateBook X Pro 2020 (ACPI GXFP51B7). TX frames are
+ *   written unwrapped and the doorbell is ACPI _DSM function 2. Each RX
+ *   record holds one complete frame: the 4-byte header followed by its
+ *   payload, so @len is 4 + the header's length field. Records are
+ *   sizeof(struct gxfp_rx_record) + gxfp_info.rx_max bytes long.
+ */
+#define GXFP_VARIANT_5130	0u
+#define GXFP_VARIANT_51B7	1u
+
+/**
+ * struct gxfp_info - transport parameters of the bound device
+ * @variant: GXFP_VARIANT_*
+ * @tx_max: largest write(2) accepted, in bytes
+ * @rx_max: largest record payload; read(2) needs a buffer of
+ *          sizeof(struct gxfp_rx_record) + @rx_max bytes
+ * @reserved: zero
+ */
+struct gxfp_info {
+	__u32 variant;
+	__u32 tx_max;
+	__u32 rx_max;
+	__u32 reserved;
+};
+
+/* Report the transport parameters. Absent (ENOTTY) on older kernels: assume 5130. */
+#define GXFP_IOCTL_GET_INFO	_IOR(GXFP_IOCTL_MAGIC, 0x01, struct gxfp_info)
+
 #endif /* _UAPI_LINUX_GXFP_H */
