@@ -68,6 +68,7 @@ static void sha256_once(const UINT8 *p, UINTN n, UINT8 out[32]){ sha256 s; sha_i
 static int eq32(const UINT8 *a,const UINT8 *b){ int i; for(i=0;i<32;i++) if(a[i]!=b[i]) return 0; return 1; }
 
 // Scan a region for a 32-byte window hashing to TARGET; print + return 1 on hit.
+// Silent on miss (for loop mode). Also reports a [0x20][32] len-prefixed record once.
 static int scan(const CHAR16 *name, UINT64 addr, UINTN len){
     volatile UINT8 *base = (UINT8 *)(UINTN)addr;
     UINT8 w[32], h[32]; UINTN i,j; int found=0;
@@ -75,13 +76,12 @@ static int scan(const CHAR16 *name, UINT64 addr, UINTN len){
         for(j=0;j<32;j++) w[j]=base[i+j];
         sha256_once(w,32,h);
         if(eq32(h,TARGET)){
-            Print(L"  *** PMK FOUND in %s at +0x%x ***\n  KEY=", name, i);
+            Print(L"\n  *** PMK FOUND in %s at +0x%x ***\n  KEY=", name, i);
             for(j=0;j<32;j++) Print(L"%02x", w[j]);
             Print(L"\n");
             found=1;
         }
     }
-    if(!found) Print(L"  %s: no PMK (scanned 0x%x bytes)\n", name, len);
     return found;
 }
 
@@ -96,38 +96,61 @@ static void dump(EFI_FILE_HANDLE root, const CHAR16 *fname, UINT64 addr, UINTN l
     Print(L"  wrote %s (0x%x bytes)\n", fname, n);
 }
 
+// Open the ESP root the app was launched from (best effort).
+static EFI_FILE_HANDLE esp_root(EFI_HANDLE Image, EFI_SYSTEM_TABLE *ST){
+    EFI_LOADED_IMAGE *li=NULL; EFI_GUID liG=LOADED_IMAGE_PROTOCOL;
+    if(EFI_ERROR(uefi_call_wrapper(ST->BootServices->HandleProtocol,3,Image,&liG,(void**)&li))||!li) return NULL;
+    EFI_FILE_IO_INTERFACE *fs=NULL; EFI_GUID fsG=SIMPLE_FILE_SYSTEM_PROTOCOL;
+    if(EFI_ERROR(uefi_call_wrapper(ST->BootServices->HandleProtocol,3,li->DeviceHandle,&fsG,(void**)&fs))||!fs) return NULL;
+    EFI_FILE_HANDLE root=NULL;
+    if(EFI_ERROR(uefi_call_wrapper(fs->OpenVolume,2,fs,&root))||!root) return NULL;
+    return root;
+}
+
 EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *ST){
     InitializeLib(Image, ST);
     Print(L"fpcap: MateBook X Pro 2020 pre-boot FP key capture\n");
-    Print(L"Looking for SHA-256(PMK) = ef39654f...87bc85c\n\n");
+    Print(L"Target SHA-256(PMK) = ef39654f...87bc85c\n");
+    Print(L"Watching BNKY/FPKY/FPDA continuously. Touch the fingerprint/power\n");
+    Print(L"button now. Press ESC to stop and continue boot.\n\n");
 
-    int hit=0;
-    hit |= scan(L"BNKY", BNKY_ADDR, BNKY_LEN);
-    hit |= scan(L"FPKY", FPKY_ADDR, FPKY_LEN);
-    hit |= scan(L"FPDA", FPDA_ADDR, FPDA_LEN);
+    EFI_FILE_HANDLE root = esp_root(Image, ST);
+    uefi_call_wrapper(ST->ConIn->Reset,2,ST->ConIn,FALSE);
 
-    // Dump raw regions to the ESP the app was launched from (best effort).
-    EFI_LOADED_IMAGE *li=NULL;
-    EFI_GUID liG=LOADED_IMAGE_PROTOCOL;
-    if(!EFI_ERROR(uefi_call_wrapper(ST->BootServices->HandleProtocol,3,Image,&liG,(void**)&li)) && li){
-        EFI_FILE_IO_INTERFACE *fs=NULL; EFI_GUID fsG=SIMPLE_FILE_SYSTEM_PROTOCOL;
-        if(!EFI_ERROR(uefi_call_wrapper(ST->BootServices->HandleProtocol,3,li->DeviceHandle,&fsG,(void**)&fs)) && fs){
-            EFI_FILE_HANDLE root=NULL;
-            if(!EFI_ERROR(uefi_call_wrapper(fs->OpenVolume,2,fs,&root)) && root){
+    int found=0; UINTN iter=0;
+    for(;;){
+        // Non-blocking ESC check.
+        EFI_INPUT_KEY key;
+        EFI_STATUS ks = uefi_call_wrapper(ST->ConIn->ReadKeyStroke,2,ST->ConIn,&key);
+        if(ks==EFI_SUCCESS && key.ScanCode==SCAN_ESC) break;
+
+        int hit=0;
+        hit |= scan(L"BNKY", BNKY_ADDR, BNKY_LEN);
+        hit |= scan(L"FPKY", FPKY_ADDR, FPKY_LEN);
+        if((iter & 7)==0) hit |= scan(L"FPDA", FPDA_ADDR, FPDA_LEN); // big region, less often
+
+        if(hit && !found){
+            found=1;
+            if(root){
                 dump(root,L"fpcap-bnky.bin",BNKY_ADDR,BNKY_LEN);
                 dump(root,L"fpcap-fpky.bin",FPKY_ADDR,FPKY_LEN);
                 dump(root,L"fpcap-fpda.bin",FPDA_ADDR,FPDA_LEN);
             }
+            Print(L"\nSUCCESS: photograph the KEY= line. Still watching; ESC to boot.\n");
         }
+
+        if((iter % 10)==0) Print(L".");       // heartbeat
+        iter++;
+        if(iter > 3000) break;                 // ~5 min safety cap if ESC never arrives
+        uefi_call_wrapper(ST->BootServices->Stall, 1, 100000); // 100 ms
     }
 
-    if(hit) Print(L"\nSUCCESS: key printed above. Photograph the KEY= line.\n");
-    else    Print(L"\nNo key this run. If you just did a BIOS fingerprint auth,\n"
-                  L"the window may have been cleared; see notes. Dumps saved for offline scan.\n");
-    Print(L"\nPress any key to continue boot...\n");
-    uefi_call_wrapper(ST->ConIn->Reset,2,ST->ConIn,FALSE);
-    EFI_INPUT_KEY key; UINTN idx;
-    uefi_call_wrapper(ST->BootServices->WaitForEvent,3,1,&ST->ConIn->WaitForKey,&idx);
-    uefi_call_wrapper(ST->ConIn->ReadKeyStroke,2,ST->ConIn,&key);
+    // Final dump regardless, for offline scanning.
+    if(root){
+        dump(root,L"fpcap-bnky-final.bin",BNKY_ADDR,BNKY_LEN);
+        dump(root,L"fpcap-fpky-final.bin",FPKY_ADDR,FPKY_LEN);
+        dump(root,L"fpcap-fpda-final.bin",FPDA_ADDR,FPDA_LEN);
+    }
+    Print(L"\n%s. Continuing boot.\n", found ? L"Key was found (see above)" : L"No key this run");
     return EFI_SUCCESS;
 }

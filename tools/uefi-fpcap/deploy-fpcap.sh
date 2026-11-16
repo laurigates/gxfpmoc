@@ -3,7 +3,9 @@
 # Reversible: `efibootmgr -b <NUM> -B` removes the entry; `efibootmgr -N` clears BootNext.
 set -euo pipefail
 
-efi="${1:-$HOME/src/uefi-fpcap/fpcap.efi}"
+# Under sudo, $HOME is /root; fall back to the invoking user's home.
+home="${SUDO_USER:+/home/$SUDO_USER}"; home="${home:-$HOME}"
+efi="${1:-$home/src/uefi-fpcap/fpcap.efi}"
 disk=/dev/nvme0n1
 part=1
 
