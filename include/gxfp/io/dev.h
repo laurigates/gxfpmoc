@@ -22,6 +22,12 @@ struct gxfp_dev {
 	uint16_t seq16;
 	unsigned int irq_timeout_ms;
 	uint8_t *rx_chunk;
+
+	/* From GXFP_IOCTL_GET_INFO; 5130 defaults on kernels without it. */
+	uint32_t variant;	/* GXFP_VARIANT_* */
+	uint32_t tx_max;
+	uint32_t rx_max;	/* record payload bytes */
+	size_t rx_record_size;
 };
 
 int gxfp_dev_open(struct gxfp_dev *dev, const char *path, int flags);

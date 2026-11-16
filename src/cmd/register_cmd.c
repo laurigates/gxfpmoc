@@ -3,6 +3,8 @@
 #include "gxfp/proto/goodix_cmd.h"
 #include "gxfp/proto/goodix_proto.h"
 #include "gxfp/proto/mp_proto.h"
+#include "gxfp/io/dev.h"
+#include "gxfp/io/uapi.h"
 
 #include <errno.h>
 #include <string.h>
@@ -84,6 +86,18 @@ int gxfp_cmd_read_chip_id(struct gxfp_dev *dev,
 	rc = gxfp_cmd_read_reg(dev, 0x0000, buf, 4);
 	if (rc != 0)
 		return rc;
+
+	if (dev->variant == GXFP_VARIANT_51B7) {
+		/*
+		 * GF_*_EC_19xxx firmware (GXFP51B7): gfspi's ChipRegRead swaps each
+		 * byte pair, then takes id = b[3] << 16 | b[2] << 8 | b[1]. On the raw
+		 * reply that is raw[2] << 16 | raw[3] << 8 | raw[0]; raw[2] is 0 for
+		 * every supported chip. Observed: 04 a2 00 25 -> 0x2504 (ChicagoHS).
+		 */
+		*out_chip_id = (uint16_t)((uint16_t)buf[0] |
+					  ((uint16_t)buf[3] << 8));
+		return 0;
+	}
 
 	*out_chip_id = (uint16_t)((uint16_t)buf[1] |
 				  ((uint16_t)buf[2] << 8));

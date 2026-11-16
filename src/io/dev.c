@@ -20,14 +20,14 @@ static int gxfp_read_chunk(struct gxfp_dev *dev,
 	const struct gxfp_rx_record *rec;
 	ssize_t n;
 
-	n = read(dev->fd, dev->rx_chunk, GXFP_RX_RECORD_SIZE);
+	n = read(dev->fd, dev->rx_chunk, dev->rx_record_size);
 	if (n < 0)
 		return -errno;
-	if ((size_t)n != GXFP_RX_RECORD_SIZE)
+	if ((size_t)n != dev->rx_record_size)
 		return -EIO;
 
 	rec = (const struct gxfp_rx_record *)dev->rx_chunk;
-	if (rec->reserved != 0 || rec->len == 0 || rec->len > GXFP_RX_MAX)
+	if (rec->reserved != 0 || rec->len == 0 || rec->len > dev->rx_max)
 		return -EBADMSG;
 
 	*out = rec;
@@ -66,7 +66,8 @@ static ssize_t gxfp_rx_assemble(struct gxfp_dev *dev, void *buf, size_t buf_cap,
 		return -EMSGSIZE;
 	}
 
-	copied = gxfp_mp_rx_chunk(total);
+	/* 51B7 records carry the whole frame; 5130 frames arrive in chunks. */
+	copied = dev->variant == GXFP_VARIANT_51B7 ? total : gxfp_mp_rx_chunk(total);
 	if (copied > rec->len)
 		copied = rec->len;
 	memcpy(frame, rec->data, copied);
@@ -128,6 +129,31 @@ gxfp_ec_headcount_seed(uint16_t *out)
 	return 0;
 }
 
+static int gxfp_dev_query_info(struct gxfp_dev *dev)
+{
+	struct gxfp_info info;
+
+	memset(&info, 0, sizeof(info));
+	if (ioctl(dev->fd, GXFP_IOCTL_GET_INFO, &info) != 0) {
+		if (errno != ENOTTY)
+			return -errno;
+		/* Kernel predates the ioctl: only the 5130 transport exists. */
+		info.variant = GXFP_VARIANT_5130;
+		info.tx_max = GXFP_TX_MAX;
+		info.rx_max = GXFP_RX_MAX;
+	}
+	if (info.variant != GXFP_VARIANT_5130 && info.variant != GXFP_VARIANT_51B7)
+		return -EPROTONOSUPPORT;
+	if (info.rx_max < GXFP_MP_CHUNK_MAX || info.tx_max == 0)
+		return -EPROTO;
+
+	dev->variant = info.variant;
+	dev->tx_max = info.tx_max;
+	dev->rx_max = info.rx_max;
+	dev->rx_record_size = sizeof(struct gxfp_rx_record) + info.rx_max;
+	return 0;
+}
+
 int gxfp_dev_open(struct gxfp_dev *dev, const char *path, int flags)
 {
 	int rc;
@@ -143,7 +169,14 @@ int gxfp_dev_open(struct gxfp_dev *dev, const char *path, int flags)
 	if (dev->fd < 0)
 		return -errno;
 
-	dev->rx_chunk = malloc(GXFP_RX_RECORD_SIZE);
+	rc = gxfp_dev_query_info(dev);
+	if (rc != 0) {
+		close(dev->fd);
+		dev->fd = -1;
+		return rc;
+	}
+
+	dev->rx_chunk = malloc(dev->rx_record_size);
 	if (!dev->rx_chunk) {
 		close(dev->fd);
 		dev->fd = -1;
@@ -244,6 +277,14 @@ int gxfp_dev_send_packet(struct gxfp_dev *dev,
 			       mp, sizeof(mp));
 	if (mp_len < 0)
 		return mp_len;
+
+	if (dev->variant == GXFP_VARIANT_51B7) {
+		/* No eSPI wrapper, sequence number or padding: send the MP frame. */
+		wr = write(dev->fd, mp, (size_t)mp_len);
+		if (wr < 0)
+			return -errno;
+		return (size_t)wr == (size_t)mp_len ? 0 : -EIO;
+	}
 
 	tx_len = gxfp_mp_wrap(mp, (size_t)mp_len, &dev->seq16, tx, sizeof(tx));
 	if (tx_len < 0)
