@@ -67,6 +67,45 @@ static void sha256_once(const UINT8 *p, UINTN n, UINT8 out[32]){ sha256 s; sha_i
 
 static int eq32(const UINT8 *a,const UINT8 *b){ int i; for(i=0;i<32;i++) if(a[i]!=b[i]) return 0; return 1; }
 
+// --- logging: mirror every diagnostic line to screen AND \fpcap.log ----------
+static EFI_FILE_HANDLE g_log = NULL;
+static void dlog(const CHAR16 *fmt, ...){
+    CHAR16 buf[512]; __builtin_va_list ap; __builtin_va_start(ap, fmt);
+    VSPrint(buf, sizeof(buf), (CHAR16*)fmt, ap); __builtin_va_end(ap);
+    Print(L"%s", buf);
+    if(g_log){
+        CHAR8 a[512]; UINTN i=0;
+        while(buf[i] && i<511){ a[i] = (buf[i] < 128) ? (CHAR8)buf[i] : '?'; i++; }
+        UINTN n=i;
+        uefi_call_wrapper(g_log->Write, 3, g_log, &n, a);
+        uefi_call_wrapper(g_log->Flush, 1, g_log);
+    }
+}
+
+// --- live change monitor -----------------------------------------------------
+static UINT8 prev_bnky[BNKY_LEN], prev_fpky[FPKY_LEN], prev_fpda[FPDA_LEN];
+static int   have_prev = 0;
+
+static UINTN nonzero(const volatile UINT8 *p, UINTN n){ UINTN i,c=0; for(i=0;i<n;i++) if(p[i]) c++; return c; }
+
+// Compare a region to its previous snapshot; on change print offset + 16 bytes
+// and the count. Returns 1 if changed. Updates the snapshot and a change counter.
+static int watch(const CHAR16 *name, UINT64 addr, UINTN len, UINT8 *prev, UINTN *chg){
+    volatile UINT8 *p = (UINT8 *)(UINTN)addr;
+    UINTN i, first = (UINTN)-1;
+    if(have_prev){
+        for(i=0;i<len;i++){ if(p[i]!=prev[i]){ first=i; break; } }
+    }
+    for(i=0;i<len;i++) prev[i]=p[i];        // refresh snapshot
+    if(first==(UINTN)-1) return 0;
+    (*chg)++;
+    dlog(L"[CHANGE %s] +0x%x nz=%d bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+         name, first, nonzero(p,len),
+         p[first], (first+1<len)?p[first+1]:0, (first+2<len)?p[first+2]:0, (first+3<len)?p[first+3]:0,
+         (first+4<len)?p[first+4]:0, (first+5<len)?p[first+5]:0, (first+6<len)?p[first+6]:0, (first+7<len)?p[first+7]:0);
+    return 1;
+}
+
 // Scan a region for a 32-byte window hashing to TARGET; print + return 1 on hit.
 // Silent on miss (for loop mode). Also reports a [0x20][32] len-prefixed record once.
 static int scan(const CHAR16 *name, UINT64 addr, UINTN len){
@@ -76,9 +115,11 @@ static int scan(const CHAR16 *name, UINT64 addr, UINTN len){
         for(j=0;j<32;j++) w[j]=base[i+j];
         sha256_once(w,32,h);
         if(eq32(h,TARGET)){
-            Print(L"\n  *** PMK FOUND in %s at +0x%x ***\n  KEY=", name, i);
-            for(j=0;j<32;j++) Print(L"%02x", w[j]);
-            Print(L"\n");
+            dlog(L"\n  *** PMK FOUND in %s at +0x%x ***\n", name, i);
+            dlog(L"  KEY=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
+                 L"%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                 w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7],w[8],w[9],w[10],w[11],w[12],w[13],w[14],w[15],
+                 w[16],w[17],w[18],w[19],w[20],w[21],w[22],w[23],w[24],w[25],w[26],w[27],w[28],w[29],w[30],w[31]);
             found=1;
         }
     }
@@ -115,20 +156,34 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *ST){
     Print(L"button now. Press ESC to stop and continue boot.\n\n");
 
     EFI_FILE_HANDLE root = esp_root(Image, ST);
+    if(root) uefi_call_wrapper(root->Open, 5, root, &g_log, L"fpcap.log",
+        EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE, 0);
     uefi_call_wrapper(ST->ConIn->Reset,2,ST->ConIn,FALSE);
 
+    dlog(L"nz = non-zero bytes now: BNKY %d/%d  FPKY %d/%d  FPDA %d/%d\n\n",
+          nonzero((UINT8*)(UINTN)BNKY_ADDR,BNKY_LEN), BNKY_LEN,
+          nonzero((UINT8*)(UINTN)FPKY_ADDR,FPKY_LEN), FPKY_LEN,
+          nonzero((UINT8*)(UINTN)FPDA_ADDR,FPDA_LEN), FPDA_LEN);
+
     int found=0; UINTN iter=0;
+    UINTN cB=0,cK=0,cD=0;   // per-region change counters
     for(;;){
         // Non-blocking ESC check.
         EFI_INPUT_KEY key;
         EFI_STATUS ks = uefi_call_wrapper(ST->ConIn->ReadKeyStroke,2,ST->ConIn,&key);
         if(ks==EFI_SUCCESS && key.ScanCode==SCAN_ESC) break;
 
+        // Live change monitor: shows when the EC writes to any region.
+        watch(L"BNKY", BNKY_ADDR, BNKY_LEN, prev_bnky, &cB);
+        watch(L"FPKY", FPKY_ADDR, FPKY_LEN, prev_fpky, &cK);
+        watch(L"FPDA", FPDA_ADDR, FPDA_LEN, prev_fpda, &cD);
+        have_prev = 1;
+
+        // Key check (the actual goal).
         int hit=0;
         hit |= scan(L"BNKY", BNKY_ADDR, BNKY_LEN);
         hit |= scan(L"FPKY", FPKY_ADDR, FPKY_LEN);
-        if((iter & 7)==0) hit |= scan(L"FPDA", FPDA_ADDR, FPDA_LEN); // big region, less often
-
+        hit |= scan(L"FPDA", FPDA_ADDR, FPDA_LEN);
         if(hit && !found){
             found=1;
             if(root){
@@ -136,12 +191,14 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *ST){
                 dump(root,L"fpcap-fpky.bin",FPKY_ADDR,FPKY_LEN);
                 dump(root,L"fpcap-fpda.bin",FPDA_ADDR,FPDA_LEN);
             }
-            Print(L"\nSUCCESS: photograph the KEY= line. Still watching; ESC to boot.\n");
+            dlog(L"\nSUCCESS: key logged to fpcap.log. Still watching; ESC to boot.\n");
         }
 
-        if((iter % 10)==0) Print(L".");       // heartbeat
+        if((iter % 20)==0)                       // status line every ~2 s
+            dlog(L"  [iter %d] changes: BNKY=%d FPKY=%d FPDA=%d  (touch sensor now)\n",
+                  iter, cB, cK, cD);
         iter++;
-        if(iter > 3000) break;                 // ~5 min safety cap if ESC never arrives
+        if(iter > 3000) break;                   // ~5 min safety cap if ESC never arrives
         uefi_call_wrapper(ST->BootServices->Stall, 1, 100000); // 100 ms
     }
 
@@ -151,6 +208,8 @@ EFI_STATUS efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *ST){
         dump(root,L"fpcap-fpky-final.bin",FPKY_ADDR,FPKY_LEN);
         dump(root,L"fpcap-fpda-final.bin",FPDA_ADDR,FPDA_LEN);
     }
-    Print(L"\n%s. Continuing boot.\n", found ? L"Key was found (see above)" : L"No key this run");
+    dlog(L"\n%s. iters=%d changes BNKY=%d FPKY=%d FPDA=%d. Continuing boot.\n",
+         found ? L"Key was found" : L"No key this run", iter, cB, cK, cD);
+    if(g_log) uefi_call_wrapper(g_log->Close, 1, g_log);
     return EFI_SUCCESS;
 }
