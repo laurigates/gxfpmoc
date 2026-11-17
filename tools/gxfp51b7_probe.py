@@ -49,7 +49,7 @@ def drain(fd: int, rec_size: int, timeout: float):
         body = data[4:4 + mp_len]
         cmd = body[0] if body else None
         print(f"  rx t={ts / 1e9:.3f} mp_type={mp_type:#x} len={mp_len} "
-              f"cmd={cmd if cmd is None else hex(cmd)} body={body[:48].hex(' ')}")
+              f"cmd={cmd if cmd is None else hex(cmd)} body={body.hex(' ')}")
         yield mp_type, body
 
 
